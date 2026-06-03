@@ -182,7 +182,7 @@ const char* breathStateName();
 const char INDEX_HTML[] PROGMEM = R"HTML(
 <!doctype html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Cool Team Detector</title>
+<title>Sleep Apnea Detection</title>
 <style>
   :root{--bg:#0c0f14;--card:#151b24;--line:#26303d;--txt:#e7eef6;--mut:#8a99ab;
         --ok:#37d39b;--warn:#ffcc55;--bad:#ff5d6c;--accent:#5aa9ff;}
@@ -211,7 +211,7 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
   #log .ds{color:var(--accent);font-weight:600}
   #log .gp{color:var(--warn)} canvas{width:100%;height:48px;display:block;margin-top:8px}
 </style></head><body>
-<h1>Cool Team Detector <span style="font-size:12px;color:var(--mut)">— by Cool Team</span></h1>
+<h1>Sleep Apnea Screener <span style="font-size:12px;color:var(--mut)">— by Cool Team</span></h1>
 <div class="sub"><span id="dot" class="dot"></span><span id="status">connecting…</span>
   &nbsp;·&nbsp;up <span id="up">0</span>s</div>
 
