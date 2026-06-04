@@ -678,7 +678,7 @@ function drawHapticEvents(){
   const W=c.width, H=c.height;
   ctx.clearRect(0,0,W,H);
 
-  const events=evtHist.filter(e=>['supine','upright','haptic','buzz'].includes(e.kind) || e.kind==='apnea');
+  const events=evtHist.filter(e=>['supine','upright','haptic','buzz'].includes(e.kind));
   if(events.length<1){
     ctx.fillStyle='#8a99ab';
     ctx.font='12px sans-serif';
@@ -700,17 +700,6 @@ function drawHapticEvents(){
   ctx.moveTo(PAD_L, PAD_T+plotH/2);
   ctx.lineTo(PAD_L+plotW, PAD_T+plotH/2);
   ctx.stroke();
-
-  // apnea references
-  evtHist.filter(e=>e.kind==='apnea').forEach(e=>{
-    const x=tx(e.t);
-    ctx.strokeStyle='rgba(255,93,108,0.85)';
-    ctx.lineWidth=2;
-    ctx.beginPath();
-    ctx.moveTo(x,PAD_T);
-    ctx.lineTo(x,PAD_T+plotH);
-    ctx.stroke();
-  });
 
   // haptic / supine markers
   evtHist.filter(e=>['supine','haptic','buzz','upright'].includes(e.kind)).forEach(e=>{
@@ -1032,7 +1021,9 @@ void pollOximeter() {
     oxNew = 0;
     maxim_heart_rate_and_oxygen_saturation(irBuf, OX_N, redBuf, &spo2, &validSPO2, &maximHR, &validHR);
     if (validSPO2) acceptSpo2((int)spo2);
+    if (validHR && maximHR >= HR_MIN_VALID && maximHR <= HR_MAX_VALID) acceptHeartRate((float)maximHR);  // <-- ADD
   }
+
 }
 
 // ======================================================================
@@ -1218,16 +1209,6 @@ void setup() {
   server.on("/", HTTP_GET, [](AsyncWebServerRequest* r) {
     r->send_P(200, "text/html", INDEX_HTML);
   });
-
-  server.on("/haptic", HTTP_GET, [](AsyncWebServerRequest* r) {
-    String kind = r->hasParam("kind") ? r->getParam("kind")->value() : "haptic";
-    long sec    = r->hasParam("sec")  ? r->getParam("sec")->value().toInt() : 0;
-    char buf[120]; unsigned long t = millis() / 1000;
-    snprintf(buf, sizeof(buf), "{\"type\":\"event\",\"kind\":\"%s\",\"t\":%lu,\"peak\":%ld}", kind.c_str(), t, sec);
-    wsBroadcast(buf);
-    r->send(200, "text/plain", "ok");
-  });
-
   server.begin();
   Serial.println("HTTP server up.\n");
 }
