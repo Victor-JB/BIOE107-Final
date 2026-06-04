@@ -910,6 +910,16 @@ void setup() {
   server.on("/", HTTP_GET, [](AsyncWebServerRequest* r) {
     r->send_P(200, "text/html", INDEX_HTML);
   });
+
+  server.on("/haptic", HTTP_GET, [](AsyncWebServerRequest* r) {
+    String kind = r->hasParam("kind") ? r->getParam("kind")->value() : "haptic";
+    long sec    = r->hasParam("sec")  ? r->getParam("sec")->value().toInt() : 0;
+    char buf[120]; unsigned long t = millis() / 1000;
+    snprintf(buf, sizeof(buf), "{\"type\":\"event\",\"kind\":\"%s\",\"t\":%lu,\"peak\":%ld}", kind.c_str(), t, sec);
+    wsBroadcast(buf);
+    r->send(200, "text/plain", "ok");
+  });
+
   server.begin();
   Serial.println("HTTP server up.\n");
 }
