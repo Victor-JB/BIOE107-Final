@@ -1,5 +1,5 @@
 /* =====================================================================
- *  COOL TEAM DETECTOR — Mask firmware  (rev 3)
+ *  COOL TEAM DETECTOR — Mask firmware  (rev 4)
  *  Team: Cool Team   |   Board: Seeed XIAO ESP32-S3 (Arduino-ESP32 3.x)
  *
  *  NEW IN REV 3
@@ -69,7 +69,30 @@ float beatsPerMinute = 0;
 int   beatAvg = 0;
 long  irValue = 0;
 bool  fingerPresent = false;
-#define FINGER_IR_MIN 20000          // lower than fingertip; mask is reflectance
+#define FINGER_IR_MIN 20000          // raw low-contact floor
+#define CONTACT_IR_ENTER 30000        // must exceed this for stable contact
+#define CONTACT_IR_EXIT  22000        // hysteresis: drop below this = no contact
+#define CONTACT_STABLE_MS 1200UL      // require stable contact before trusting SpO2/HR
+#define CONTACT_LOST_GRACE_MS 400UL   // short grace before clearing display
+#define SPO2_MIN_VALID 70
+#define SPO2_MAX_VALID 100
+#define SPO2_MAX_STEP 8               // reject impossible one-window jumps
+#define SPO2_SMOOTH_ALPHA 0.35f
+#define HR_MIN_VALID 35
+#define HR_MAX_VALID 190
+#define HR_MAX_STEP 35
+#define HR_SMOOTH_ALPHA 0.35f
+
+bool  contactReliable = false;
+bool  contactCandidate = false;
+unsigned long contactCandidateStart = 0;
+unsigned long lastReliableContactMs = 0;
+bool  contactWasReliable = false;
+bool  spo2Valid = false;
+bool  hrValid = false;
+int   hrShow = 0;
+unsigned long validSpo2Ms = 0;
+unsigned long lastValidClockMs = 0;
 
 // --- SpO2 from Maxim buffered algorithm ---
 #define OX_N 100
@@ -132,6 +155,14 @@ float micRms = 0;
 unsigned long soundEventCount = 0, lastSoundMs = 0;
 
 // ----------------------------------------------------------------------
+//  Haptic / positional therapy events from the separate IMU node
+//  The haptic node calls: /haptic?kind=supine&sec=0 and
+//  /haptic?kind=upright&sec=<duration>. We count these and display them
+//  as buzz/posture markers in the History tab.
+// ----------------------------------------------------------------------
+unsigned long hapticEventCount = 0;
+
+// ----------------------------------------------------------------------
 //  Battery
 // ----------------------------------------------------------------------
 float vbat = 0; int batPct = 0;
@@ -182,7 +213,7 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
   .pill.ex{background:rgba(90,169,255,.2);color:var(--accent)}
   #log,#etable{max-height:180px;overflow:auto;margin-top:8px;font-size:13px}
   #log div,#etable div{padding:5px 0;border-bottom:1px solid var(--line)}
-  .ap{color:var(--bad);font-weight:600}.ds{color:var(--accent);font-weight:600}.gp{color:var(--warn)}
+  .ap{color:var(--bad);font-weight:600}.ds{color:var(--accent);font-weight:600}.gp{color:var(--warn)}.hp{color:var(--mild);font-weight:600}
   canvas{width:100%;display:block;margin-top:8px}
   .chart{height:120px}
   .breathchart{height:150px}
@@ -225,7 +256,7 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
     <div class="label">OSA Severity — ODI-based screening</div>
     <div class="row" style="align-items:center;margin-top:10px">
       <span id="sevbadge" class="sev-badge sev-normal">NORMAL</span>
-      <span class="small" style="text-align:right">min SpO₂ <b id="minSpo2Live">--</b>% &nbsp;·&nbsp; elapsed <b id="elapsed">0</b> min</span>
+      <span class="small" style="text-align:right">min SpO₂ <b id="minSpo2Live">--</b>% &nbsp;·&nbsp; valid SpO₂ <b id="validSpo2Min">0</b> min</span>
     </div>
     <div class="row small" style="margin-top:10px;gap:6px">
       <span style="color:var(--ok)">● Normal &lt;5</span>
@@ -280,6 +311,7 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
       <span>ODI <b id="hODI">0.0</b>/h</span>
       <span>desats <b id="hDes">0</b></span>
       <span>apneas <b id="hAp">0</b></span>
+      <span>buzzes <b id="hBuzz">0</b></span>
       <span>min SpO₂ <b id="hMin">--</b>%</span>
     </div>
     <div class="row small" style="margin-top:6px">
@@ -310,6 +342,15 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
   <div class="card wide">
     <div class="label">Heart rate over time</div>
     <canvas id="cHr" class="chart" width="520" height="120"></canvas>
+  </div>
+  <div class="card wide">
+    <div class="label">Buzzing / positional therapy instances</div>
+    <canvas id="cBuzz" class="chart" width="520" height="120"></canvas>
+    <div class="legend">
+      <span><span class="lswatch" style="background:#ffcc55"></span>Buzz / supine trigger</span>
+      <span><span class="lswatch" style="background:#37d39b"></span>Returned off back</span>
+      <span><span class="lswatch" style="background:#ff5d6c"></span>Apnea event</span>
+    </div>
   </div>
   <div class="card wide">
     <div class="label">Event log (full session)</div>
@@ -357,7 +398,12 @@ function sevInfo(odi){
   if(odi>=5)  return {label:'MILD',    cls:'sev-mild'};
   return              {label:'NORMAL', cls:'sev-normal'};
 }
-function applySev(badgeEl, odi){
+function applySev(badgeEl, odi, validSec=0){
+  if(validSec < 60){
+    badgeEl.textContent='INSUFFICIENT DATA';
+    badgeEl.className='sev-badge sev-mild';
+    return;
+  }
   const s=sevInfo(odi);
   badgeEl.textContent=s.label;
   badgeEl.className='sev-badge '+s.cls;
@@ -365,39 +411,54 @@ function applySev(badgeEl, odi){
 
 function handle(m){
   if(m.type==='beat'){ pulse(); return; }
-  if(m.type==='event'){ evtHist.push(m); logEvent(m); if(histOn)renderEvents(); return; }
+  if(m.type==='event'){
+    evtHist.push(m);
+    logEvent(m);
+    if(histOn){ renderEvents(); drawBreathWave(); drawHapticEvents(); }
+    return;
+  }
   if(m.type!=='telemetry') return;
 
   if(!sessionStartMs) sessionStartMs=Date.now();
   const elapsedMin=Math.round((Date.now()-sessionStartMs)/60000);
+  const validSec = m.validSpo2Sec || 0;
+  const validMin = Math.floor(validSec/60);
+  const contact = !!m.contact;
 
   $('up').textContent=m.uptime;
 
-  // --- SpO2 ---
-  if(m.spo2>0){
+  // --- SpO2, gated by reliable optical contact ---
+  if(contact && m.spo2Valid && m.spo2>0){
     $('spo2').textContent=m.spo2;
-    $('oxstat').textContent='reading';
+    $('oxstat').textContent='Contact detected';
     $('spo2').style.color=(m.spo2<90)?'var(--bad)':(m.spo2<94?'var(--warn)':'var(--ok)');
     if(m.spo2<minSpo2) minSpo2=m.spo2;
   } else {
     $('spo2').textContent='--';
-    $('oxstat').textContent=m.ir>20000?'signal ok, computing…':'no skin contact';
+    $('spo2').style.color='var(--mut)';
+    $('oxstat').textContent=contact ? 'Acquiring stable signal…' : 'No contact detected';
   }
   $('odi').textContent=m.odi.toFixed(1);
   $('desat').textContent=m.desat;
-  $('base').textContent=m.base>0?m.base:'--';
+  $('base').textContent=(contact && m.base>0)?m.base:'--';
   $('ir').textContent=m.ir;
 
-  // --- Severity (live) ---
-  applySev($('sevbadge'), m.odi);
+  // --- Severity (live): only meaningful after enough valid contact time ---
+  applySev($('sevbadge'), m.odi, validSec);
   $('minSpo2Live').textContent=(minSpo2<999)?minSpo2:'--';
-  $('elapsed').textContent=elapsedMin;
+  $('validSpo2Min').textContent=validMin;
 
-  // --- HR ---
-  if(m.hr>0){ $('bpm').textContent=Math.round(m.hr); pushHrLive(m.hr); }
-  $('finger').textContent=m.finger?'contact ✔':'no contact';
+  // --- HR, gated by reliable optical contact ---
+  if(contact && m.hrValid && m.hr>0){
+    $('bpm').textContent=Math.round(m.hr);
+    $('finger').textContent='Contact detected';
+    pushHrLive(m.hr);
+  } else {
+    $('bpm').textContent='--';
+    $('finger').textContent=contact ? 'Acquiring stable signal…' : 'No contact detected';
+  }
 
-  // --- breathing / sound / battery ---
+  // --- breathing / sound / haptic / battery ---
   $('rr').textContent=m.rr>0?m.rr.toFixed(1):'--';
   $('bstate').textContent=m.breath;
   $('bstate').className='pill'+(m.breath==='EXHALE'?' ex':'');
@@ -414,27 +475,31 @@ function handle(m){
   $('apc').textContent=m.apnea;
 
   // --- history summary ---
-  $('hODI').textContent=m.odi.toFixed(1);
+  $('hODI').textContent=(validSec>=60)?m.odi.toFixed(1):'insufficient';
   $('hDes').textContent=m.desat;
   $('hAp').textContent=m.apnea;
+  if($('hBuzz')) $('hBuzz').textContent=m.haptic || 0;
   $('hMin').textContent=(minSpo2<999)?minSpo2:'--';
   $('hElapsed').textContent=elapsedMin;
-  applySev($('hSevBadge'), m.odi);
+  applySev($('hSevBadge'), m.odi, validSec);
 
   // --- breathing waveform accumulation (1 Hz downsample from 2 Hz telem) ---
   if(m.uptime !== lastBreathT){
     lastBreathT = m.uptime;
-    // Use breathDeviation (dev) as the airflow proxy — centred on 0,
-    // positive = warm (exhale near sensor), negative = cool (inhale or apnea)
     breathWave.push({ t: m.uptime, dev: m.dev, breath: m.breath });
     if(breathWave.length > BREATH_MAX_PTS) breathWave.shift();
     if(histOn) drawBreathWave();
   }
 
-  // --- SpO2 / HR history sample (every 5 s) ---
+  // --- SpO2 / HR history sample (every 5 s). Invalid contact is stored as
+  // blanks, not zeros, so the chart/CSV never treats no-contact as a reading.
   if(m.uptime - lastHistT >= 5){
     lastHistT = m.uptime;
-    sampHist.push({t:m.uptime, spo2:m.spo2, hr:m.hr});
+    sampHist.push({
+      t:m.uptime,
+      spo2:(contact && m.spo2Valid && m.spo2>0) ? m.spo2 : null,
+      hr:(contact && m.hrValid && m.hr>0) ? m.hr : null
+    });
     if(sampHist.length>1500) sampHist.shift();
     if(histOn) redrawHist();
   }
@@ -445,10 +510,12 @@ function pulse(){ const h=$('heart'); h.classList.add('beat'); setTimeout(()=>h.
 function logEvent(m){
   if(firstLog){ $('log').innerHTML=''; firstLog=false; }
   const d=document.createElement('div');
-  d.className=m.kind==='apnea'?'ap':(m.kind==='desat'?'ds':(m.kind==='gasp'?'gp':''));
+  d.className=m.kind==='apnea'?'ap':(m.kind==='desat'?'ds':(m.kind==='gasp'?'gp':(['supine','upright','haptic','buzz'].includes(m.kind)?'hp':'')));
   let t=m.kind.toUpperCase()+' @ '+m.t+'s';
   if(m.kind==='apnea') t+='  (gap '+m.gap+'s)';
   else if(m.kind==='desat') t+='  (−'+m.drop+'% → '+m.spo2+'%)';
+  else if(m.kind==='supine') t+='  (buzzing: user on back)';
+  else if(m.kind==='upright') t+='  (off back after '+(m.peak||0)+'s)';
   else if(m.peak!=null) t+='  ('+m.peak+' rms)';
   d.textContent=t; $('log').prepend(d);
 }
@@ -464,22 +531,43 @@ function pushHrLive(v){
 function drawSeries(id, data, key, color, big){
   const c=$(id), x=c.getContext('2d'), w=c.width, h=c.height;
   x.clearRect(0,0,w,h);
-  const pts=data.filter(d=>d[key]>0);
-  if(pts.length<2){
-    x.fillStyle='#8a99ab'; x.font='12px sans-serif'; x.fillText('collecting…',8,18); return;
+
+  const valid=data.filter(d=>d[key]!=null && d[key]>0);
+  if(valid.length<2){
+    x.fillStyle='#8a99ab';
+    x.font='12px sans-serif';
+    x.fillText('collecting valid contact data…',8,18);
+    return;
   }
-  const pad=big?26:0;
-  let mn=Math.min(...pts.map(d=>d[key]))-2, mx=Math.max(...pts.map(d=>d[key]))+2;
+
+  const pad=big?30:0;
+  let mn=Math.min(...valid.map(d=>d[key]))-2, mx=Math.max(...valid.map(d=>d[key]))+2;
   const r=mx-mn||1;
-  x.strokeStyle=color; x.lineWidth=2; x.beginPath();
-  pts.forEach((d,i)=>{
-    const px=pad+i/(pts.length-1)*(w-pad-2), py=h-8-(d[key]-mn)/r*(h-16);
-    i?x.lineTo(px,py):x.moveTo(px,py);
+  const t0=data[0].t, t1=data[data.length-1].t, span=Math.max(1,t1-t0);
+  const pxFor=d=>pad+(d.t-t0)/span*(w-pad-2);
+  const pyFor=d=>h-8-(d[key]-mn)/r*(h-16);
+
+  // Draw line in segments so no-contact gaps are not connected.
+  x.strokeStyle=color;
+  x.lineWidth=2;
+  let drawing=false;
+  x.beginPath();
+  data.forEach(d=>{
+    if(d[key]==null || d[key]<=0){
+      drawing=false;
+      return;
+    }
+    const px=pxFor(d), py=pyFor(d);
+    if(!drawing){ x.moveTo(px,py); drawing=true; }
+    else x.lineTo(px,py);
   });
   x.stroke();
+
   if(big){
-    x.fillStyle='#8a99ab'; x.font='10px sans-serif';
-    x.fillText(Math.round(mx),2,12); x.fillText(Math.round(mn),2,h-2);
+    x.fillStyle='#8a99ab';
+    x.font='10px sans-serif';
+    x.fillText(Math.round(mx),2,12);
+    x.fillText(Math.round(mn),2,h-2);
   }
 }
 
@@ -583,10 +671,79 @@ function fmtTime(s){
   return m+'m'+String(sec).padStart(2,'0')+'s';
 }
 
+function drawHapticEvents(){
+  const c=$('cBuzz');
+  if(!c) return;
+  const ctx=c.getContext('2d');
+  const W=c.width, H=c.height;
+  ctx.clearRect(0,0,W,H);
+
+  const events=evtHist.filter(e=>['supine','upright','haptic','buzz'].includes(e.kind) || e.kind==='apnea');
+  if(events.length<1){
+    ctx.fillStyle='#8a99ab';
+    ctx.font='12px sans-serif';
+    ctx.fillText('no buzzing/posture events yet…',8,22);
+    return;
+  }
+
+  let allT=events.map(e=>e.t);
+  if(breathWave.length){ allT.push(breathWave[0].t, breathWave[breathWave.length-1].t); }
+  const tMin=Math.min(...allT), tMax=Math.max(...allT), span=Math.max(1,tMax-tMin);
+  const PAD_L=30, PAD_R=8, PAD_T=12, PAD_B=22;
+  const plotW=W-PAD_L-PAD_R, plotH=H-PAD_T-PAD_B;
+  const tx=t=>PAD_L+(t-tMin)/span*plotW;
+
+  // baseline
+  ctx.strokeStyle='rgba(138,153,171,0.3)';
+  ctx.lineWidth=1;
+  ctx.beginPath();
+  ctx.moveTo(PAD_L, PAD_T+plotH/2);
+  ctx.lineTo(PAD_L+plotW, PAD_T+plotH/2);
+  ctx.stroke();
+
+  // apnea references
+  evtHist.filter(e=>e.kind==='apnea').forEach(e=>{
+    const x=tx(e.t);
+    ctx.strokeStyle='rgba(255,93,108,0.85)';
+    ctx.lineWidth=2;
+    ctx.beginPath();
+    ctx.moveTo(x,PAD_T);
+    ctx.lineTo(x,PAD_T+plotH);
+    ctx.stroke();
+  });
+
+  // haptic / supine markers
+  evtHist.filter(e=>['supine','haptic','buzz','upright'].includes(e.kind)).forEach(e=>{
+    const x=tx(e.t);
+    const isOff=e.kind==='upright';
+    ctx.strokeStyle=isOff?'#37d39b':'#ffcc55';
+    ctx.lineWidth=3;
+    ctx.beginPath();
+    ctx.moveTo(x, isOff ? PAD_T+plotH/2 : PAD_T+4);
+    ctx.lineTo(x, isOff ? PAD_T+plotH-4 : PAD_T+plotH/2);
+    ctx.stroke();
+
+    ctx.fillStyle=isOff?'#37d39b':'#ffcc55';
+    ctx.font='10px sans-serif';
+    ctx.fillText(isOff?'off back':'buzz', Math.min(x+4,W-55), isOff?PAD_T+plotH-8:PAD_T+12);
+  });
+
+  // time axis
+  ctx.fillStyle='#8a99ab';
+  ctx.font='10px sans-serif';
+  ctx.textAlign='center';
+  for(let i=0;i<=4;i++){
+    const t=tMin+i/4*span;
+    ctx.fillText(fmtTime(t), tx(t), H-4);
+  }
+  ctx.textAlign='left';
+}
+
 function redrawHist(){
   drawBreathWave();
   drawSeries('cSpo2', sampHist, 'spo2', '#37d39b', true);
   drawSeries('cHr',   sampHist, 'hr',   '#5aa9ff', true);
+  drawHapticEvents();
   renderEvents();
 }
 
@@ -597,8 +754,10 @@ function renderEvents(){
     let d=e.kind.toUpperCase()+' @ '+e.t+'s';
     if(e.kind==='apnea') d+=' (gap '+e.gap+'s)';
     else if(e.kind==='desat') d+=' (−'+e.drop+'%→'+e.spo2+'%)';
+    else if(e.kind==='supine') d+=' (buzzing: user on back)';
+    else if(e.kind==='upright') d+=' (off back after '+(e.peak||0)+'s)';
     else if(e.peak!=null) d+=' ('+e.peak+' rms)';
-    html+='<div class="'+(e.kind==='apnea'?'ap':e.kind==='desat'?'ds':e.kind==='gasp'?'gp':'')+'">'+d+'</div>';
+    html+='<div class="'+(e.kind==='apnea'?'ap':e.kind==='desat'?'ds':e.kind==='gasp'?'gp':(['supine','upright','haptic','buzz'].includes(e.kind)?'hp':''))+'">'+d+'</div>';
   });
   t.innerHTML=html;
 }
@@ -606,16 +765,28 @@ function renderEvents(){
 function exportCsv(){
   let rows=['kind,t_seconds,detail'];
   evtHist.forEach(e=>{
-    let det=e.kind==='apnea'?('gap='+e.gap+'s'):(e.kind==='desat'?('drop='+e.drop+'%,spo2='+e.spo2):(e.peak!=null?('peak='+e.peak):''));
+    let det='';
+    if(e.kind==='apnea') det='gap='+e.gap+'s';
+    else if(e.kind==='desat') det='drop='+e.drop+'%,spo2='+e.spo2;
+    else if(e.kind==='supine') det='buzz_start=true,on_back=true';
+    else if(e.kind==='upright') det='buzz_stop=true,duration_sec='+(e.peak||0);
+    else if(e.peak!=null) det='peak='+e.peak;
     rows.push(e.kind+','+e.t+','+det);
   });
-  rows.push(''); rows.push('t_seconds,spo2,hr');
-  sampHist.forEach(s=>rows.push(s.t+','+(s.spo2||'')+','+(s.hr?Math.round(s.hr):'')));
-  rows.push(''); rows.push('t_seconds,breath_dev,breath_state');
+
+  rows.push('');
+  rows.push('t_seconds,spo2,hr');
+  sampHist.forEach(s=>rows.push(s.t+','+(s.spo2??'')+','+(s.hr?Math.round(s.hr):'')));
+
+  rows.push('');
+  rows.push('t_seconds,breath_dev,breath_state');
   breathWave.forEach(p=>rows.push(p.t+','+p.dev.toFixed(3)+','+p.breath));
+
   const blob=new Blob([rows.join('\n')],{type:'text/csv'});
   const a=document.createElement('a');
-  a.href=URL.createObjectURL(blob); a.download='coolteam_session.csv'; a.click();
+  a.href=URL.createObjectURL(blob);
+  a.download='coolteam_session.csv';
+  a.click();
 }
 
 connect();
@@ -645,20 +816,29 @@ void sendEvent(const char* kind, long a1, long a2) {
 // Rev 3: telemetry includes "dev" (breathDeviation) so dashboard can build
 // the breathing waveform from normal 2 Hz telemetry — no extra WS message needed.
 void sendTelemetry() {
-  char buf[700];
+  char buf[860];
   int baseInt = isnan(spo2Baseline) ? 0 : (int)lround(spo2Baseline);
+  unsigned long validSec = validSpo2Ms / 1000UL;
   snprintf(buf, sizeof(buf),
     "{\"type\":\"telemetry\",\"uptime\":%lu,"
-    "\"spo2\":%d,\"odi\":%.1f,\"desat\":%lu,\"base\":%d,\"ir\":%ld,"
+    "\"contact\":%s,\"spo2Valid\":%s,\"hrValid\":%s,"
+    "\"spo2\":%d,\"odi\":%.1f,\"desat\":%lu,\"base\":%d,\"ir\":%ld,\"validSpo2Sec\":%lu,"
     "\"hr\":%d,\"finger\":%s,"
     "\"rr\":%.1f,\"breath\":\"%s\",\"exhales\":%lu,\"tempC\":%.2f,\"dev\":%.3f,"
-    "\"micRms\":%.0f,\"sounds\":%lu,\"vbat\":%.2f,\"batPct\":%d,\"apnea\":%lu}",
+    "\"micRms\":%.0f,\"sounds\":%lu,\"haptic\":%lu,"
+    "\"vbat\":%.2f,\"batPct\":%d,\"apnea\":%lu}",
     millis() / 1000,
-    spo2Show, jf(odi), desatCount, baseInt, irValue,
-    beatAvg, fingerPresent ? "true" : "false",
+    contactReliable ? "true" : "false",
+    spo2Valid ? "true" : "false",
+    hrValid ? "true" : "false",
+    (contactReliable && spo2Valid) ? spo2Show : 0,
+    jf(odi), desatCount, baseInt, irValue, validSec,
+    (contactReliable && hrValid) ? hrShow : 0,
+    contactReliable ? "true" : "false",
     jf(respRate), breathStateName(), exhaleCount,
-    jf(tempFiltered), jf(breathDeviation),   // <-- dev now 3 dp for waveform fidelity
-    jf(micRms), soundEventCount, jf(vbat), batPct, apneaCount);
+    jf(tempFiltered), jf(breathDeviation),
+    jf(micRms), soundEventCount, hapticEventCount,
+    jf(vbat), batPct, apneaCount);
   wsBroadcast(buf);
 }
 
@@ -674,67 +854,184 @@ const char* breathStateName() {
 // ======================================================================
 //  SpO2 / HR / ODI
 // ======================================================================
+void clearOximeterDisplayState() {
+  // Clear values that should not be displayed when the MAX30102 is not
+  // actually in contact. Counts are preserved, but baseline and detector
+  // states reset so old data does not contaminate the next contact window.
+  spo2Show = 0;
+  hrShow = 0;
+  spo2Valid = false;
+  hrValid = false;
+  beatAvg = 0;
+  beatsPerMinute = 0;
+  lastBeat = 0;
+  memset(rates, 0, sizeof(rates));
+  rateSpot = 0;
+  oxFill = 0;
+  oxNew = 0;
+  validSPO2 = 0;
+  validHR = 0;
+  spo2Baseline = NAN;
+  odiState = OX_NORMAL;
+}
+
+void updateContactQuality() {
+  unsigned long now = millis();
+
+  // Hysteresis prevents the UI from flickering around the threshold.
+  bool rawStrong = contactReliable ? (irValue > CONTACT_IR_EXIT) : (irValue > CONTACT_IR_ENTER);
+
+  if (rawStrong) {
+    if (!contactCandidate) {
+      contactCandidate = true;
+      contactCandidateStart = now;
+    }
+    if (!contactReliable && (now - contactCandidateStart >= CONTACT_STABLE_MS)) {
+      contactReliable = true;
+      lastReliableContactMs = now;
+    }
+    if (contactReliable) lastReliableContactMs = now;
+  } else {
+    contactCandidate = false;
+    if (contactReliable && (now - lastReliableContactMs > CONTACT_LOST_GRACE_MS)) {
+      contactReliable = false;
+    }
+  }
+
+  // On transition from reliable contact -> no contact, immediately clear
+  // displayed SpO2/HR and stop using the current optical buffers.
+  if (contactWasReliable && !contactReliable) {
+    clearOximeterDisplayState();
+  }
+  contactWasReliable = contactReliable;
+}
+
+void updateValidSpo2Clock() {
+  unsigned long now = millis();
+  if (lastValidClockMs == 0) {
+    lastValidClockMs = now;
+    return;
+  }
+
+  if (contactReliable) validSpo2Ms += (now - lastValidClockMs);
+  lastValidClockMs = now;
+
+  float validHrs = validSpo2Ms / 3600000.0f;
+  odi = (validHrs > 1e-4f) ? (desatCount / validHrs) : 0.0f;
+}
+
 void updateOdi(float s) {
-  if (irValue < FINGER_IR_MIN) return;
+  if (!contactReliable || !spo2Valid) return;
+
   if (isnan(spo2Baseline)) spo2Baseline = s;
   unsigned long now = millis();
+
   switch (odiState) {
     case OX_NORMAL:
       spo2Baseline = (1.0 - SPO2_BASE_ALPHA) * spo2Baseline + SPO2_BASE_ALPHA * s;
-      if (spo2Baseline - s >= DESAT_DROP) { odiState = OX_DROP; dropStart = now; }
+      if (spo2Baseline - s >= DESAT_DROP) {
+        odiState = OX_DROP;
+        dropStart = now;
+      }
       break;
+
     case OX_DROP:
-      if (spo2Baseline - s < DESAT_DROP) odiState = OX_NORMAL;
-      else if (now - dropStart >= DESAT_MIN_MS) {
+      if (spo2Baseline - s < DESAT_DROP) {
+        odiState = OX_NORMAL;
+      } else if (now - dropStart >= DESAT_MIN_MS) {
         desatCount++;
         sendEvent("desat", (long)lround(spo2Baseline - s), spo2Show);
         odiState = OX_RECOVER;
       }
       break;
+
     case OX_RECOVER:
       if (s >= spo2Baseline - 1.0) odiState = OX_NORMAL;
       break;
   }
-  float hrs = millis() / 3600000.0;
-  if (hrs > 1e-4) odi = desatCount / hrs;
+
+  float validHrs = validSpo2Ms / 3600000.0f;
+  odi = (validHrs > 1e-4f) ? (desatCount / validHrs) : 0.0f;
+}
+
+void acceptHeartRate(float bpm) {
+  if (bpm < HR_MIN_VALID || bpm > HR_MAX_VALID) return;
+  if (hrValid && abs((int)bpm - hrShow) > HR_MAX_STEP) return;
+
+  if (!hrValid) hrShow = (int)lround(bpm);
+  else hrShow = (int)lround((1.0f - HR_SMOOTH_ALPHA) * hrShow + HR_SMOOTH_ALPHA * bpm);
+
+  rates[rateSpot++] = (byte)hrShow;
+  rateSpot %= RATE_SIZE;
+  beatAvg = 0;
+  for (byte i = 0; i < RATE_SIZE; i++) beatAvg += rates[i];
+  beatAvg /= RATE_SIZE;
+  hrValid = true;
+  sendBeat();
+}
+
+void acceptSpo2(int candidate) {
+  if (candidate < SPO2_MIN_VALID || candidate > SPO2_MAX_VALID) return;
+  if (spo2Valid && abs(candidate - spo2Show) > SPO2_MAX_STEP) return;
+
+  if (!spo2Valid) spo2Show = candidate;
+  else spo2Show = (int)lround((1.0f - SPO2_SMOOTH_ALPHA) * spo2Show + SPO2_SMOOTH_ALPHA * candidate);
+
+  spo2Valid = true;
+  updateOdi((float)spo2Show);
 }
 
 void pollOximeter() {
   if (!maxOk) return;
+
   sensor.check();
   while (sensor.available()) {
     uint32_t red = sensor.getRed();
     uint32_t ir  = sensor.getIR();
     sensor.nextSample();
-    irValue = ir;
 
-    // --- heart rate from beat detection ---
+    irValue = ir;
+    updateContactQuality();
+
+    if (!contactReliable) {
+      // Keep reading the sensor, but do not feed beat detection or the
+      // Maxim SpO2 window. This prevents random no-contact values.
+      continue;
+    }
+
+    // --- heart rate from beat detection, gated by reliable contact ---
     if (checkForBeat(ir)) {
       long now = millis();
-      float bpm = 60000.0 / (now - lastBeat);
-      lastBeat = now;
-      if (bpm > 20 && bpm < 255) {
-        beatsPerMinute = bpm;
-        rates[rateSpot++] = (byte)bpm; rateSpot %= RATE_SIZE;
-        beatAvg = 0; for (byte i = 0; i < RATE_SIZE; i++) beatAvg += rates[i]; beatAvg /= RATE_SIZE;
-        sendBeat();
+      if (lastBeat > 0) {
+        float bpm = 60000.0f / (now - lastBeat);
+        acceptHeartRate(bpm);
       }
+      lastBeat = now;
     }
 
-    // --- fill window for Maxim SpO2 ---
-    if (oxFill < OX_N) { redBuf[oxFill] = red; irBuf[oxFill] = ir; oxFill++; }
-    else {
+    // --- fill window for Maxim SpO2, gated by reliable contact ---
+    if (oxFill < OX_N) {
+      redBuf[oxFill] = red;
+      irBuf[oxFill] = ir;
+      oxFill++;
+    } else {
       memmove(redBuf, redBuf + 1, (OX_N - 1) * sizeof(uint32_t));
       memmove(irBuf,  irBuf  + 1, (OX_N - 1) * sizeof(uint32_t));
-      redBuf[OX_N - 1] = red; irBuf[OX_N - 1] = ir; oxNew++;
+      redBuf[OX_N - 1] = red;
+      irBuf[OX_N - 1] = ir;
+      oxNew++;
     }
   }
-  fingerPresent = irValue > FINGER_IR_MIN;
+
+  updateContactQuality();
+  fingerPresent = contactReliable;
+
+  if (!contactReliable) return;
 
   if (oxFill >= OX_N && oxNew >= 25) {
     oxNew = 0;
     maxim_heart_rate_and_oxygen_saturation(irBuf, OX_N, redBuf, &spo2, &validSPO2, &maximHR, &validHR);
-    if (validSPO2 && spo2 > 0 && spo2 <= 100) { spo2Show = spo2; updateOdi((float)spo2); }
+    if (validSPO2) acceptSpo2((int)spo2);
   }
 }
 
@@ -885,7 +1182,7 @@ void startAP() {
 void setup() {
   pinMode(LED_BUILTIN, OUTPUT); ledWrite(true);
   Serial.begin(115200); delay(300);
-  Serial.println("\n=== Cool Team Detector (mask) rev3 ===");
+  Serial.println("\n=== Cool Team Detector (mask) rev4 ===");
   analogReadResolution(12); analogSetAttenuation(ADC_11db);
 
   Wire.begin();
@@ -907,6 +1204,17 @@ void setup() {
 
   startAP();
   ws.onEvent(onWsEvent); server.addHandler(&ws);
+
+  // Endpoint called by the separate IMU / haptic node whenever vibration
+  // starts because the user is supine, or stops when the user rolls off back.
+  server.on("/haptic", HTTP_GET, [](AsyncWebServerRequest* r) {
+    String kind = r->hasParam("kind") ? r->getParam("kind")->value() : "haptic";
+    long sec = r->hasParam("sec") ? r->getParam("sec")->value().toInt() : 0;
+    hapticEventCount++;
+    sendEvent(kind.c_str(), 0, sec);
+    r->send(200, "text/plain", "ok");
+  });
+
   server.on("/", HTTP_GET, [](AsyncWebServerRequest* r) {
     r->send_P(200, "text/html", INDEX_HTML);
   });
@@ -918,6 +1226,7 @@ void loop() {
   unsigned long now = millis();
 
   pollOximeter();
+  updateValidSpo2Clock();
 
   if (now - lastSoundMs >= SOUND_PERIOD_MS)   { lastSoundMs = now; sampleSoundLevel(); }
   if (now - lastBreathSample >= BREATH_PERIOD_MS) updateBreath();
@@ -928,9 +1237,10 @@ void loop() {
   // Serial diagnostics every 3 s
   if (now - lastDiagMs >= 3000) {
     lastDiagMs = now;
-    Serial.printf("clients=%u  IR=%ld finger=%d  HR(avg)=%d  SpO2=%d(valid=%d)  base=%.0f  desat=%lu  apnea=%lu  dev=%.3f\n",
-      ws.count(), irValue, fingerPresent, beatAvg, spo2Show, validSPO2,
-      isnan(spo2Baseline) ? 0 : spo2Baseline, desatCount, apneaCount, breathDeviation);
+    Serial.printf("clients=%u  IR=%ld contact=%d  HR=%d(valid=%d)  SpO2=%d(valid=%d)  validSpO2=%lus  base=%.0f  desat=%lu  apnea=%lu  haptic=%lu  dev=%.3f\n",
+      ws.count(), irValue, contactReliable, hrShow, hrValid, spo2Show, spo2Valid,
+      validSpo2Ms/1000UL, isnan(spo2Baseline) ? 0 : spo2Baseline,
+      desatCount, apneaCount, hapticEventCount, breathDeviation);
   }
 
   updateLed(true);
